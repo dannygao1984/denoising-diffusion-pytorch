@@ -389,12 +389,12 @@ class Unet(nn.Module):
         return self.final_conv(x)
 
 # gaussian diffusion trainer class
-
 def extract(a, t, x_shape):
     b, *_ = t.shape
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
+# 输入Scale的T 返回T个step, 例如 betas = tensor([0.0005, 0.0010, 0.0015, ..., 0.1000])
 def linear_beta_schedule(timesteps):
     scale = 1000 / timesteps
     beta_start = scale * 0.0001
@@ -442,6 +442,7 @@ class GaussianDiffusion(nn.Module):
 
         assert objective in {'pred_noise', 'pred_x0'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start)'
 
+        # 生成所有的betas, 以T=200为例，产生的betas=tensor([0.0005, 0.0010, 0.0015, 0.0020, ..., 0.1000]) 
         if beta_schedule == 'linear':
             betas = linear_beta_schedule(timesteps)
         elif beta_schedule == 'cosine':
@@ -449,8 +450,12 @@ class GaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'unknown beta schedule {beta_schedule}')
 
+        # 生成所有的alphas = tensor([0.9995, 0.9990, 0.9985, 0.9980, ..., 0.9000])
         alphas = 1. - betas
+        # 生成所有的\bar{alphas} = tensor([9.9950e-01, 9.9850e-01, 9.9700e-01, ..., 3.0318e-05])
         alphas_cumprod = torch.cumprod(alphas, dim=0)
+        # 生成所有的\bar{alphas}_{t-1} = tensor([1, 9.9950e-01, 9.9850e-01, 9.9700e-01, ..., 3.3687e-05])
+        # 这里使用了Pad函数在在最低维度上前面补充 value = 1
         alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.)
 
         timesteps, = betas.shape
@@ -466,7 +471,7 @@ class GaussianDiffusion(nn.Module):
         self.ddim_sampling_eta = ddim_sampling_eta
 
         # helper function to register buffer from float64 to float32
-
+        # register_buffer 可以理解模型的hyperparameters，模型的一部分但是不需要更新
         register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
 
         register_buffer('betas', betas)
@@ -474,7 +479,6 @@ class GaussianDiffusion(nn.Module):
         register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
 
         # calculations for diffusion q(x_t | x_{t-1}) and others
-
         register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
         register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
         register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod))
@@ -482,11 +486,9 @@ class GaussianDiffusion(nn.Module):
         register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
 
         # calculations for posterior q(x_{t-1} | x_t, x_0)
-
         posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
 
         # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
-
         register_buffer('posterior_variance', posterior_variance)
 
         # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
