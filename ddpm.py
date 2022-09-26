@@ -12,6 +12,10 @@ import torch
 from torch import nn, einsum
 import torch.nn.functional as F
 
+import torchvision
+
+
+# 参考 https://huggingface.co/blog/annotated-diffusion
 
 """
 Network Helper
@@ -350,7 +354,7 @@ def sigmoid_beta_schedule(timesteps):
     betas = torch.linspace(-6, 6, timesteps)
     return torch.sigmoid(betas) * (beta_end - beta_start) + beta_start
 
-timesteps = 200
+timesteps = 50
 
 # define beta schedule
 betas = linear_beta_schedule(timesteps=timesteps)
@@ -369,6 +373,9 @@ sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - alphas_cumprod)
 posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
 
 def extract(a, t, x_shape):
+    print("Extract a:{}".format(a))
+    print("Extract t:{}".format(t))
+    print("Extract x_shape:{}".format(x_shape))
     batch_size = t.shape[0]
     out = a.gather(-1, t.cpu())
     return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
@@ -407,8 +414,14 @@ def q_sample(x_start, t, noise=None):
     sqrt_one_minus_alphas_cumprod_t = extract(
         sqrt_one_minus_alphas_cumprod, t, x_start.shape
     )
-
-    return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
+    print("q_sample before return")
+    print("sqrt_alphas_cumprod_t:{}".format(sqrt_alphas_cumprod_t.shape))
+    print("x_start:{}".format(x_start.shape))
+    print("sqrt_one_minus_alphas_cumprod_t:{}".format(sqrt_one_minus_alphas_cumprod_t.shape))
+    print("noise:{}".format(noise.shape))
+    out = sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
+    print("out:{}".format(out.shape))
+    return out
 
 def get_noisy_image(x_start, t):
       # add noise
@@ -424,8 +437,11 @@ def p_losses(denoise_model, x_start, t, noise=None, loss_type="l1"):
     if noise is None:
         noise = torch.randn_like(x_start)
 
+    print("Build q_sample")
     x_noisy = q_sample(x_start=x_start, t=t, noise=noise)
+    print("Build q_sample 1 done")
     predicted_noise = denoise_model(x_noisy, t)
+    print("Build q_sample done")
 
     if loss_type == 'l1':
         loss = F.l1_loss(noise, predicted_noise)
@@ -438,16 +454,12 @@ def p_losses(denoise_model, x_start, t, noise=None, loss_type="l1"):
 
     return loss
 
-from datasets import load_dataset
 
-# load dataset from the hub
-print("Begin loading data")
-dataset = load_dataset("fashion_mnist")
-print("Done Loading data")
 
 image_size = 28
 channels = 1
 batch_size = 128
+import torchvision
 from torchvision import transforms
 from torch.utils.data import DataLoader
 
@@ -460,19 +472,29 @@ transform = Compose([
 
 # define function
 def transforms(examples):
-   examples["pixel_values"] = [transform(image.convert("L")) for image in examples["image"]]
+   examples["pixel_values"] = [transform(Image.fromarray(np.array(image), 'L')) for image in examples["image"]]
    del examples["image"]
-
    return examples
+
+from datasets import load_dataset
+
+# load dataset from the hub
+print("Begin loading data")
+dataset = load_dataset("fashion_mnist", data_dir="/Users/dehong.gdh/Documents/work/workspace/fashion-mnist/data/")
+print("Done Loading data")
 
 transformed_dataset = dataset.with_transform(transforms).remove_columns("label")
 
 # create dataloader
-dataloader = DataLoader(transformed_dataset["train"], batch_size=batch_size, shuffle=True)
+print("Create dataloader")
+dataloader = DataLoader(transformed_dataset["train"], batch_size=batch_size)
+print("Dataloader {}".format(dataloader))
 
+print("Next iter")
 batch = next(iter(dataloader))
 print(batch.keys())
 
+print("Create forward process")
 @torch.no_grad()
 def p_sample(model, x, t, t_index):
     betas_t = extract(betas, t, x.shape)
@@ -514,9 +536,8 @@ def p_sample_loop(model, shape):
 def sample(model, image_size, batch_size=16, channels=3):
     return p_sample_loop(model, shape=(batch_size, channels, image_size, image_size))
 
-
+print("Create Result folder")
 from pathlib import Path
-
 def num_to_groups(num, divisor):
     groups = num // divisor
     remainder = num % divisor
@@ -529,9 +550,11 @@ results_folder = Path("./results")
 results_folder.mkdir(exist_ok = True)
 save_and_sample_every = 1000
 
+print("Begin building model")
 from torch.optim import Adam
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cpu"
+# device = "cuda" if torch.cuda.is_available() else "cpu"
 
 model = Unet(
     dim=image_size,
@@ -539,6 +562,7 @@ model = Unet(
     dim_mults=(1, 2, 4,)
 )
 model.to(device)
+print("Done building model")
 
 optimizer = Adam(model.parameters(), lr=1e-3)
 
@@ -550,13 +574,17 @@ for epoch in range(epochs):
     for step, batch in enumerate(dataloader):
       optimizer.zero_grad()
 
+      print("batch size:{}".format(batch["pixel_values"].shape[0]))
       batch_size = batch["pixel_values"].shape[0]
+      print("batch device:{}".format(device))
       batch = batch["pixel_values"].to(device)
 
       # Algorithm 1 line 3: sample t uniformally for every example in the batch
       t = torch.randint(0, timesteps, (batch_size,), device=device).long()
-
+      
+      print("Build loss")
       loss = p_losses(model, batch, t, loss_type="huber")
+      print("Build loss done")
 
       if step % 100 == 0:
         print("Loss:", loss.item())
