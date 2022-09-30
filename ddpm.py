@@ -1,19 +1,19 @@
 import os
-os.environ['KMP_DUPLICATE_LIB_OK']='True'
+import torch
+
 import math
 from inspect import isfunction
 from functools import partial
 
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
-from einops import rearrange
+# from einops import rearrange
 
-import torch
 from torch import nn, einsum
 import torch.nn.functional as F
 
 import torchvision
-
+from einops import rearrange
 
 # 参考 https://huggingface.co/blog/annotated-diffusion
 
@@ -295,33 +295,39 @@ class Unet(nn.Module):
         )
 
     def forward(self, x, time):
+        # x size [BS, CHN, IMAGE_SIZE, IMAGE_SIZE] - 输入的照片
         x = self.init_conv(x)
 
+        # time_mlp 是一个timestamp的bias
+        # time  [BS]                -   对应文章里面的t
+        # t     [BS, IMAGE_SIZE*4]  -   timestamp 的 embedding
         t = self.time_mlp(time) if exists(self.time_mlp) else None
 
         h = []
 
-        # downsample
+        # downsample ? 为什么从18->28->56->112
+        # x from [BS, 18, IMAGE_SIZE, IMAGE_SIZE] to [BS, 28, IMAGE_SIZE//2, IMAGE_SIZE//2]
+        #   to [BS, 56, IMAGE_SIZE//4, IMAGE_SIZE//4] to [BS, 112, IMAGE_SIZE//4, IMAGE_SIZE//4]
         for block1, block2, attn, downsample in self.downs:
-            x = block1(x, t)
+            x = block1(x, t)    # t - timestamp embedding 加入到block中
             x = block2(x, t)
             x = attn(x)
             h.append(x)
             x = downsample(x)
 
         # bottleneck
-        x = self.mid_block1(x, t)
-        x = self.mid_attn(x)
-        x = self.mid_block2(x, t)
+        x = self.mid_block1(x, t)   # x size [BS, 112, IMAGE_SIZE//4, IMAGE_SIZE//4]
+        x = self.mid_attn(x)        # x size [BS, 112, IMAGE_SIZE//4, IMAGE_SIZE//4]
+        x = self.mid_block2(x, t)   # x size [BS, 112, IMAGE_SIZE//4, IMAGE_SIZE//4]
 
-        # upsample
+        # upsample from [BS, 112, IMAGE_SIZE//4, IMAGE_SIZE//4] to [BS, 56, IMAGE_SIZE//4, IMAGE_SIZE//4] to [BS, 56, IMAGE_SIZE//2, IMAGE_SIZE//2] to [BS, 28, IMAGE_SIZE, IMAGE_SIZE]
         for block1, block2, attn, upsample in self.ups:
-            x = torch.cat((x, h.pop()), dim=1)
+            x = torch.cat((x, h.pop()), dim=1) # x size from [BS, X, ?, ?] -> [BS, 2*X, ?, ?]
             x = block1(x, t)
             x = block2(x, t)
             x = attn(x)
             x = upsample(x)
-
+        # return size [BS, 1, IMAGE_SIZE, IMAGE_SIZE]
         return self.final_conv(x)
 
 """
@@ -354,7 +360,7 @@ def sigmoid_beta_schedule(timesteps):
     betas = torch.linspace(-6, 6, timesteps)
     return torch.sigmoid(betas) * (beta_end - beta_start) + beta_start
 
-timesteps = 50
+timesteps = 2000
 
 # define beta schedule
 betas = linear_beta_schedule(timesteps=timesteps)
@@ -373,11 +379,11 @@ sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - alphas_cumprod)
 posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
 
 def extract(a, t, x_shape):
-    print("Extract a:{}".format(a))
-    print("Extract t:{}".format(t))
-    print("Extract x_shape:{}".format(x_shape))
+    # a shape [TS] - 表示 Timestamp, 预先存储了所有的超参数, 例如 alphas, beta, sqrt_alphas_cumprod 等等
+    # t shape [BS] - 表示随机产生的某个timestamp, 因为要为每个训练数据产生一个Timestamp所以维度是[BS] 
     batch_size = t.shape[0]
-    out = a.gather(-1, t.cpu())
+    out = a.gather(-1, t.cpu()) # out size [BS]
+    # return shape [BS, CHN, 1, 1] - 返回随机产生的timestamp 对应的参数值
     return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
 
 from PIL import Image
@@ -395,7 +401,6 @@ transform = Compose([
     
 ])
 
-
 import numpy as np
 
 reverse_transform = Compose([
@@ -410,55 +415,46 @@ def q_sample(x_start, t, noise=None):
     if noise is None:
         noise = torch.randn_like(x_start)
 
+    # sqrt_alphas_cumprod_t size [BS, CHN, 1, 1] - 超参数 前向均值weight
     sqrt_alphas_cumprod_t = extract(sqrt_alphas_cumprod, t, x_start.shape)
+    # sqrt_alphas_cumprod_t size [BS, CHN, 1, 1] - 超参数 前向方差weight
     sqrt_one_minus_alphas_cumprod_t = extract(
         sqrt_one_minus_alphas_cumprod, t, x_start.shape
     )
-    print("q_sample before return")
-    print("sqrt_alphas_cumprod_t:{}".format(sqrt_alphas_cumprod_t.shape))
-    print("x_start:{}".format(x_start.shape))
-    print("sqrt_one_minus_alphas_cumprod_t:{}".format(sqrt_one_minus_alphas_cumprod_t.shape))
-    print("noise:{}".format(noise.shape))
-    out = sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
-    print("out:{}".format(out.shape))
-    return out
+    # return size [BS, CHN, IMAGE_SIZE, IMAGE_SIZE] - 加入t时刻噪声的前馈输出
+    return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
 
 def get_noisy_image(x_start, t):
-      # add noise
-  x_noisy = q_sample(x_start, t=t)
+    # add noise
+    x_noisy = q_sample(x_start, t=t)
 
-  # turn back into PIL image
-  noisy_image = reverse_transform(x_noisy.squeeze())
+    # turn back into PIL image
+    noisy_image = reverse_transform(x_noisy.squeeze())
 
-  return noisy_image
+    return noisy_image
 
 
 def p_losses(denoise_model, x_start, t, noise=None, loss_type="l1"):
     if noise is None:
         noise = torch.randn_like(x_start)
-
-    print("Build q_sample")
-    x_noisy = q_sample(x_start=x_start, t=t, noise=noise)
-    print("Build q_sample 1 done")
-    predicted_noise = denoise_model(x_noisy, t)
-    print("Build q_sample done")
-
+    # x_noisy [BS, CHN, IMAGE_SIZE, IMAGE_SIZE] - 表示t时刻带噪声的图片
+    x_noisy = q_sample(x_start=x_start, t=t, noise=noise)   # 前向过程，直接通过close form的形式求得t时刻x_noisy
+    predicted_noise = denoise_model(x_noisy, t) # 反向过程，通过神经网络从噪音生成图像，predicted_noise size [BS, CHN, IMAGE_SIZE, IMAGE_SIZE]
+    
     if loss_type == 'l1':
         loss = F.l1_loss(noise, predicted_noise)
     elif loss_type == 'l2':
         loss = F.mse_loss(noise, predicted_noise)
     elif loss_type == "huber":
-        loss = F.smooth_l1_loss(noise, predicted_noise)
+        loss = F.smooth_l1_loss(noise, predicted_noise) # 计算t时刻噪声和标准噪声的 smooth_l1_loss
     else:
         raise NotImplementedError()
 
     return loss
 
-
-
 image_size = 28
 channels = 1
-batch_size = 128
+batch_size = 256
 import torchvision
 from torchvision import transforms
 from torch.utils.data import DataLoader
@@ -480,21 +476,18 @@ from datasets import load_dataset
 
 # load dataset from the hub
 print("Begin loading data")
-dataset = load_dataset("fashion_mnist", data_dir="/Users/dehong.gdh/Documents/work/workspace/fashion-mnist/data/")
+# dataset = load_dataset("fashion_mnist", data_dir="~/workspace/workgroup/fashion-mnist/data/fashion/")
+dataset = load_dataset("fashion_mnist")
 print("Done Loading data")
 
 transformed_dataset = dataset.with_transform(transforms).remove_columns("label")
 
 # create dataloader
-print("Create dataloader")
 dataloader = DataLoader(transformed_dataset["train"], batch_size=batch_size)
-print("Dataloader {}".format(dataloader))
 
-print("Next iter")
 batch = next(iter(dataloader))
 print(batch.keys())
 
-print("Create forward process")
 @torch.no_grad()
 def p_sample(model, x, t, t_index):
     betas_t = extract(betas, t, x.shape)
@@ -503,10 +496,9 @@ def p_sample(model, x, t, t_index):
     )
     sqrt_recip_alphas_t = extract(sqrt_recip_alphas, t, x.shape)
     
-    # Equation 11 in the paper
-    # Use our model (noise predictor) to predict the mean
+    # 公式(11) 用训练的噪声预测模型 预测 均值mean
     model_mean = sqrt_recip_alphas_t * (
-        x - betas_t * model(x, t) / sqrt_one_minus_alphas_cumprod_t
+        x - betas_t * model(x, t) / sqrt_one_minus_alphas_cumprod_t # t的关系
     )
 
     if t_index == 0:
@@ -514,13 +506,13 @@ def p_sample(model, x, t, t_index):
     else:
         posterior_variance_t = extract(posterior_variance, t, x.shape)
         noise = torch.randn_like(x)
-        # Algorithm 2 line 4:
+        # 算法2: Line 4 根据t时刻噪声 x 预测t-1的噪声
         return model_mean + torch.sqrt(posterior_variance_t) * noise 
 
-# Algorithm 2 (including returning all images)
+# 算法2
 @torch.no_grad()
 def p_sample_loop(model, shape):
-    device = next(model.parameters()).device
+    device = next(model.parameters()).device # next
 
     b = shape[0]
     # start from pure noise (for each example in the batch)
@@ -536,7 +528,6 @@ def p_sample_loop(model, shape):
 def sample(model, image_size, batch_size=16, channels=3):
     return p_sample_loop(model, shape=(batch_size, channels, image_size, image_size))
 
-print("Create Result folder")
 from pathlib import Path
 def num_to_groups(num, divisor):
     groups = num // divisor
@@ -550,11 +541,10 @@ results_folder = Path("./results")
 results_folder.mkdir(exist_ok = True)
 save_and_sample_every = 1000
 
-print("Begin building model")
 from torch.optim import Adam
 
-device = "cpu"
-# device = "cuda" if torch.cuda.is_available() else "cpu"
+# device = "cpu"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 model = Unet(
     dim=image_size,
@@ -562,41 +552,40 @@ model = Unet(
     dim_mults=(1, 2, 4,)
 )
 model.to(device)
-print("Done building model")
 
 optimizer = Adam(model.parameters(), lr=1e-3)
 
 from torchvision.utils import save_image
 
-epochs = 5
+epochs = 100
 
 for epoch in range(epochs):
     for step, batch in enumerate(dataloader):
       optimizer.zero_grad()
 
-      print("batch size:{}".format(batch["pixel_values"].shape[0]))
       batch_size = batch["pixel_values"].shape[0]
-      print("batch device:{}".format(device))
       batch = batch["pixel_values"].to(device)
 
-      # Algorithm 1 line 3: sample t uniformally for every example in the batch
+      # t size [BS] - 从均匀分布给Batch每个样本产生一个随机t时刻
       t = torch.randint(0, timesteps, (batch_size,), device=device).long()
       
-      print("Build loss")
+      # loss [1] - loss 对应Algorithm1 的Line 5，即 标准正太分布和t时刻噪声的Loss
       loss = p_losses(model, batch, t, loss_type="huber")
-      print("Build loss done")
-
+      
       if step % 100 == 0:
-        print("Loss:", loss.item())
-
+        print("Step: {} Loss: {}".format(step, loss.item()))
+      # 计算Loss的梯度
       loss.backward()
       optimizer.step()
 
       # save generated images
-      if step != 0 and step % save_and_sample_every == 0:
+      if step % save_and_sample_every == 0:
+        print("Step:{} generate images".format(step))
         milestone = step // save_and_sample_every
         batches = num_to_groups(4, batch_size)
-        all_images_list = list(map(lambda n: sample(model, batch_size=n, channels=channels), batches))
-        all_images = torch.cat(all_images_list, dim=0)
+        all_images_list = list(map(lambda n: torch.tensor(sample(model, image_size, batch_size=n, channels=channels)), batches))
+        # all_images_list = list(map(lambda n: sample(model, image_size, batch_size=n, channels=channels), batches))
+        all_images = torch.cat(all_images_list, dim=0).transpose(0, 1)
         all_images = (all_images + 1) * 0.5
-        save_image(all_images, str(results_folder / f'sample-{milestone}.png'), nrow = 6)
+        for i in range(all_images.size(0)):
+            save_image(all_images[i], str(results_folder / f'sample-{epoch}-{milestone}-{i}.png'), nrow = 6)
